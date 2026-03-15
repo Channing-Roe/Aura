@@ -230,7 +230,7 @@ Run in Windows Terminal as Administrator. Restart when prompted. Without WSL, AU
 
 ### Step 1 — Clone the repository
 ```bash
-git clone https://github.com/yourusername/AURA.git
+git clone https://github.com/chainspimp/AURA.git
 cd AURA
 ```
 
