@@ -456,7 +456,7 @@ Pull requests are welcome. For major changes, open an issue first to discuss wha
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Custom License — see [LICENSE](LICENSE) for details.
 
 ---
 
