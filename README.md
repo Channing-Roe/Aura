@@ -133,7 +133,7 @@ ollama pull qwen2.5-vl:7b
 
 **Step 2 — Clone the repo**
 ```bash
-git clone https://github.com/YOUR_USERNAME/AURA.git
+git clone https://github.com/Channing-Roe/AURA.git
 cd AURA
 ```
 
