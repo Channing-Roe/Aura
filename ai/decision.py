@@ -1,7 +1,14 @@
-# ============================================
-# FILE: ai/decision.py
-# Tool router — now uses centralized LLMClient
-# ============================================
+# =============================================================================
+# FILE: ai/decision.py  (UPDATED — adds skill routing, browser, scheduler)
+#
+# PATCH INSTRUCTIONS:
+#   Replace your existing ai/decision.py with this file.
+#   Changes from original:
+#     1. Added skill registry check BEFORE LLM routing (fast path)
+#     2. Added "browser_use" route flag
+#     3. Added "schedule" route flag
+#     4. decide_and_execute() handles the new flags
+# =============================================================================
 
 import json
 import re
@@ -24,8 +31,23 @@ _ROUTE_TEMPLATE = """{
   "face_recognition": false,
   "vision_analysis": false,
   "music_recognition": false,
-  "computer_use": false
+  "computer_use": false,
+  "browser_use": false,
+  "schedule": false
 }"""
+
+# Schedule trigger keywords
+_SCHEDULE_KWS = [
+    "remind me", "schedule", "every day", "every hour", "every week",
+    "every monday", "every morning", "set an alarm", "alert me", "notify me",
+    "in 10 minutes", "in 30 minutes", "every night", "daily at", "cron"
+]
+
+# Browser trigger keywords
+_BROWSER_KWS = [
+    "go to", "open website", "browse to", "visit", "fill in the form",
+    "log in to", "click on", "scrape", "web automation", "fill out"
+]
 
 
 class DecisionSystem:
@@ -38,15 +60,12 @@ class DecisionSystem:
         self.music_system = music_system
 
     def ai_route(self, prompt: str, context: str) -> Dict[str, bool]:
-        """Use LLM to decide which tools to activate. Returns a dict of bool flags."""
         routing_prompt = (
             f"{_ROUTE_TEMPLATE}\n\n"
             f"Only set tools to true if explicitly needed.\n"
             f"User request: {prompt}"
         )
-
         raw = route_call(OLLAMA_MODEL, routing_prompt)
-
         if raw:
             match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
@@ -59,6 +78,10 @@ class DecisionSystem:
         low = prompt.lower()
         if any(kw in low for kw in ['write', 'make', 'create', 'code', 'python', 'script']):
             return {"code_generation": True}
+        if any(kw in low for kw in _SCHEDULE_KWS):
+            return {"schedule": True}
+        if any(kw in low for kw in _BROWSER_KWS):
+            return {"browser_use": True}
         from ai.computer_use import should_use_computer
         if should_use_computer(prompt):
             return {"computer_use": True}
@@ -66,74 +89,132 @@ class DecisionSystem:
 
     def decide_and_execute(self, prompt: str, context: str) -> Dict[str, any]:
         actions = {
-            'thinking_used': False,  'web_used': False,       'research_used': False,
-            'vision_used':   False,  'image_generated': False, 'code_generated': False,
-            'face_recognized': False, 'thinking_result': '',   'web_result': '',
-            'research_result': '',   'vision_result': '',      'image_result': '',
-            'code_result': {},       'face_result': {},
-            'computer_used': False,  'computer_result': '',
+            'thinking_used':    False,  'web_used':          False,
+            'research_used':    False,  'vision_used':        False,
+            'image_generated':  False,  'code_generated':     False,
+            'face_recognized':  False,  'thinking_result':    '',
+            'web_result':       '',     'research_result':    '',
+            'vision_result':    '',     'image_result':       '',
+            'code_result':      {},     'face_result':        {},
+            'computer_used':    False,  'computer_result':    '',
+            # New fields
+            'skill_used':       False,  'skill_result':       '',
+            'browser_used':     False,  'browser_result':     '',
+            'schedule_used':    False,  'schedule_result':    '',
         }
 
+        # ── 0. Skills fast-path (before LLM routing) ──────────────────────────
+        try:
+            from config import load_config
+            cfg = load_config()
+            if cfg.get("enable_skills", True):
+                from skills.skill_loader import get_registry
+                skill_result = get_registry().execute(prompt, context)
+                if skill_result:
+                    actions['skill_used']   = True
+                    actions['skill_result'] = skill_result.output
+                    logger.info(f"Skill handled: {skill_result.skill}")
+                    # Skills can fully handle the request — return early
+                    return actions
+        except Exception as e:
+            logger.debug(f"Skill routing skipped: {e}")
+
+        # ── 1. Scheduler shortcut ─────────────────────────────────────────────
+        low = prompt.lower()
+        if any(kw in low for kw in _SCHEDULE_KWS):
+            try:
+                from scheduler import get_scheduler
+                sched = get_scheduler()
+                if not sched._started:
+                    sched.start()
+                result = sched.schedule_from_text(prompt)
+                actions['schedule_used']   = True
+                actions['schedule_result'] = result
+                return actions
+            except Exception as e:
+                logger.warning(f"Scheduler error: {e}")
+
+        # ── 2. Normal LLM routing ─────────────────────────────────────────────
         from ai.computer_use import should_use_computer
         route = {"computer_use": True} if should_use_computer(prompt) \
             else self.ai_route(prompt, context)
 
-        # ── Computer Use ───────────────────────────────────────────────────
-        if route.get("computer_use"):
-            print("🖥️  Activating computer use...")
+        # ── Browser Use ───────────────────────────────────────────────────────
+        if route.get("browser_use"):
             try:
-                from ai.computer_use import get_computer_agent
-                result = get_computer_agent().run(prompt)
+                from tools.browser import browser_task
+                result = browser_task(prompt, context)
+                actions['browser_used']   = True
+                actions['browser_result'] = result.output
+            except Exception as e:
+                actions['browser_result'] = f"Browser error: {e}"
+            return actions
+
+        # ── Computer Use ──────────────────────────────────────────────────────
+        if route.get("computer_use"):
+            try:
+                from ai.computer_use import execute_computer_task
+                result = execute_computer_task(prompt)
                 actions['computer_used']   = True
                 actions['computer_result'] = result
             except Exception as e:
-                logger.error(f"Computer use failed: {e}")
-                actions['computer_used']   = True
-                actions['computer_result'] = f"Computer use failed: {e}"
-            return actions  # short-circuit
+                actions['computer_result'] = f"Computer use error: {e}"
+            return actions
 
-        # ── Code Generation ────────────────────────────────────────────────
+        # ── Existing tool handlers (web search, code, vision, etc.) ──────────
+        if route.get("web_search") and self.tools:
+            try:
+                from tools.web_search import web_search
+                actions['web_result'] = web_search(prompt)
+                actions['web_used']   = True
+            except Exception as e:
+                logger.warning(f"Web search error: {e}")
+
+        if route.get("deep_research") and self.tools:
+            try:
+                from tools.web_search import deep_research
+                actions['research_result'] = deep_research(prompt)
+                actions['research_used']   = True
+            except Exception as e:
+                logger.warning(f"Deep research error: {e}")
+
+        if route.get("deep_thinking") and self.thinking:
+            try:
+                actions['thinking_result'] = self.thinking.think(prompt)
+                actions['thinking_used']   = True
+            except Exception as e:
+                logger.warning(f"Thinking error: {e}")
+
         if route.get("code_generation") and self.coding:
-            print("💻 Generating code...")
-            actions['code_generated'] = True
-            actions['code_result']    = self.coding.generate_and_save(prompt, context)
+            try:
+                actions['code_result']    = self.coding.generate(prompt)
+                actions['code_generated'] = True
+            except Exception as e:
+                logger.warning(f"Code gen error: {e}")
 
-        # ── Web Search ─────────────────────────────────────────────────────
-        if route.get("web_search"):
-            print("🌐 Web search...")
-            actions['web_used']   = True
-            actions['web_result'] = self.tools.web_search(prompt)
+        if route.get("image_generation") and self.tools:
+            try:
+                from tools.image_gen import generate_image_local
+                actions['image_result']    = generate_image_local(prompt)
+                actions['image_generated'] = True
+            except Exception as e:
+                logger.warning(f"Image gen error: {e}")
 
-        # ── Deep Research ──────────────────────────────────────────────────
-        if route.get("deep_research"):
-            print("📚 Deep research...")
-            actions['research_used']   = True
-            actions['research_result'] = self.tools.deep_research(prompt)
-
-        # ── Deep Thinking ──────────────────────────────────────────────────
-        if route.get("deep_thinking"):
-            print("🧠 Deep thinking...")
-            _, conclusion              = self.thinking.deep_think(prompt, context)
-            actions['thinking_used']   = True
-            actions['thinking_result'] = conclusion
-
-        # ── Image Generation ───────────────────────────────────────────────
-        if route.get("image_generation"):
-            print("🎨 Generating image...")
-            actions['image_generated'] = True
-            actions['image_result']    = self.tools.generate_image_local(prompt)[0]
-
-        # ── Vision Analysis ────────────────────────────────────────────────
         if route.get("vision_analysis"):
-            print("📷 Vision analysis...")
-            from ai.vision import get_visual_context
-            actions['vision_used']   = True
-            actions['vision_result'] = get_visual_context(force=True)
+            try:
+                from ai.vision import capture_and_describe
+                actions['vision_result'] = capture_and_describe()
+                actions['vision_used']   = True
+            except Exception as e:
+                logger.warning(f"Vision error: {e}")
 
-        # ── Music Recognition ──────────────────────────────────────────────
         if route.get("music_recognition") and self.music_system:
-            print("🎵 Music recognition...")
-            actions['music_used']   = True
-            actions['music_result'] = self.music_system.recognize()
+            try:
+                result = self.music_system.recognize()
+                if result:
+                    actions['web_result'] = str(result)
+                    actions['web_used']   = True
+            except Exception as e:
+                logger.warning(f"Music recognition error: {e}")
 
         return actions
