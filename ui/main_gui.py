@@ -9,6 +9,8 @@
 import os, sys, time, threading, subprocess, logging
 from datetime import datetime
 from typing import Optional, List, Dict, Callable
+from aura_startup import bootstrap_aura
+bootstrap_aura(your_respond_function)
 
 import tkinter as tk
 from tkinter import filedialog
